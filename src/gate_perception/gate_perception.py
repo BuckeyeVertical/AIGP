@@ -29,22 +29,26 @@ import numpy as np
 CX, CY = 320.0, 180.0
 FX, FY = 320.0, 320.0
 
-# The gate shifts color under dynamic lighting, so the mask ORs several HSV
-# bands. Each band is ((H_lo,S_lo,V_lo), (H_hi,S_hi,V_hi)); a band whose H_lo >
-# H_hi is a hue-wrap band (split around 0/180 in _mask). Retune with --tune.
+# The course background is mostly grey (near-zero saturation), while the gate is
+# always some saturated color in the purple->red range -- red-orange ~#f52b03
+# (HSV ~(5,252,245)) in normal light, pale pink ~#ffc4f6 (HSV ~(155,59,255))
+# when blown out. So rather than tune a tight band per color state, mask one
+# broad hue band spanning purple/magenta/pink (130-179) through red/orange
+# (0-15) and let the saturation floor reject the grey background.
 #
-# RED_BAND: the normal gate color ~#f52b03 -> HSV ~(5,252,245). Hue wraps past
-# 0/180, so this captures orange-red (0-12) plus deep red (170-179).
-RED_BAND = ((170, 90, 70), (12, 255, 255))
-# GLARE_BAND: under bright light the gate blows out to a pale pink ~#ffc4f6 ->
-# HSV ~(155,59,255) -- opposite hue, low saturation, max brightness. A separate
-# low-saturation/high-value band catches this without dragging RED_BAND's floor
-# down (which would let washed-out background in).
-GLARE_BAND = ((145, 25, 190), (165, 130, 255))
-GATE_BANDS = [RED_BAND, GLARE_BAND]
+# Band format is ((H_lo,S_lo,V_lo), (H_hi,S_hi,V_hi)); H_lo > H_hi marks a
+# hue-wrap band (split around 0/180 in _band_mask). The S floor (~40) is the key
+# knob: grey sits near S=0 while even the washed-out pink holds S~59, so a modest
+# floor separates them. Retune with --tune.
+GATE_BAND = ((130, 40, 50), (15, 255, 255))
+GATE_BANDS = [GATE_BAND]
 
 # A detection below this confidence is reported but flagged low_confidence.
 CONFIDENCE_FLOOR = 0.35
+
+# Inner opening as a fraction of the outer gate (1500mm inner / 2700mm outer).
+# Used to sample only the colored frame ring when learning gate color.
+INNER_RATIO = 1500.0 / 2700.0
 
 
 @dataclass
@@ -66,7 +70,15 @@ def pixel_to_angle(px, py):
 
 
 class GateDetector:
-    def __init__(self, bands=GATE_BANDS, min_area=400, kernel_size=5):
+    def __init__(
+        self,
+        bands=GATE_BANDS,
+        min_area=400,
+        kernel_size=5,
+        adaptive=False,
+        learn_rate=0.2,
+        backproj_thresh=60,
+    ):
         # Each band kept as (lower, upper) uint8 arrays; the mask ORs them all.
         self.bands = [
             (np.array(lo, dtype=np.uint8), np.array(hi, dtype=np.uint8))
@@ -78,6 +90,17 @@ class GateDetector:
         )
         self.last_mask = None  # cleaned mask from the most recent detect()
 
+        # Adaptive color: learn the gate's actual H-S histogram online from
+        # confident detections, then OR a backprojection of it into the static
+        # mask so coverage follows lighting/color drift. The static bands remain
+        # the bootstrap seed and the always-on fallback for re-acquisition.
+        self.adaptive = adaptive
+        self.learn_rate = learn_rate  # online histogram blend weight (0..1)
+        self.backproj_thresh = backproj_thresh
+        self._hist = None  # learned H-S histogram (float32) or None
+        self.last_backproj = None  # thresholded backprojection from last detect()
+        self._H_BINS, self._S_BINS = 30, 32
+
     @staticmethod
     def _band_mask(hsv, lo, hi):
         if lo[0] <= hi[0]:
@@ -88,18 +111,60 @@ class GateDetector:
         high_band = cv2.inRange(hsv, lo, np.array([179, hi[1], hi[2]], np.uint8))
         return cv2.bitwise_or(low_band, high_band)
 
-    def _mask(self, image_bgr):
-        hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+    def _build_mask(self, hsv):
         mask = None
         for lo, hi in self.bands:
             band = self._band_mask(hsv, lo, hi)
             mask = band if mask is None else cv2.bitwise_or(mask, band)
+
+        self.last_backproj = None
+        if self.adaptive and self._hist is not None:
+            # Smooth the histogram so each learned color also covers adjacent
+            # hues/sats -- this is what lets backprojection bridge gradual color
+            # drift instead of lagging a bin behind it.
+            hist = cv2.GaussianBlur(self._hist, (0, 0), sigmaX=1.0, sigmaY=1.0)
+            cv2.normalize(hist, hist, 0, 255, cv2.NORM_MINMAX)
+            backproj = cv2.calcBackProject(
+                [hsv], [0, 1], hist, [0, 180, 0, 256], scale=1
+            )
+            _, backproj = cv2.threshold(
+                backproj, self.backproj_thresh, 255, cv2.THRESH_BINARY
+            )
+            self.last_backproj = backproj
+            mask = cv2.bitwise_or(mask, backproj)
+
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self.kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self.kernel)
         return mask
 
+    def _learn_color(self, hsv, x, y, w, h):
+        """Update the learned H-S histogram from the confirmed gate region.
+
+        Samples the gate's colored frame by its spatial ring -- the outer bbox
+        minus the inner opening (1500mm of the 2700mm outer per gate geometry) --
+        rather than by the current color mask. Sampling spatially is what lets
+        the histogram pick up the gate's *actual* color even when it has drifted
+        outside the static bands; the inner hole is excluded so background seen
+        through the gate doesn't pollute it.
+        """
+        roi_hsv = hsv[y : y + h, x : x + w]
+        ring = np.full((h, w), 255, dtype=np.uint8)
+        iw, ih = int(w * INNER_RATIO), int(h * INNER_RATIO)
+        ix, iy = (w - iw) // 2, (h - ih) // 2
+        ring[iy : iy + ih, ix : ix + iw] = 0
+        hist = cv2.calcHist(
+            [roi_hsv], [0, 1], ring, [self._H_BINS, self._S_BINS], [0, 180, 0, 256]
+        )
+        cv2.normalize(hist, hist, 0, 255, cv2.NORM_MINMAX)
+        if self._hist is None:
+            self._hist = hist
+        else:
+            # Exponential moving average so color tracks drift but resists jumps.
+            self._hist = (1 - self.learn_rate) * self._hist + self.learn_rate * hist
+
     def detect(self, image_bgr) -> GateDetection:
-        mask = self._mask(image_bgr)
+        hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+        mask = self._build_mask(hsv)
         self.last_mask = mask
 
         contours, _ = cv2.findContours(
@@ -133,6 +198,11 @@ class GateDetector:
         angle_x, angle_y = pixel_to_angle(center_x, center_y)
         confidence = self._confidence(mask, x, y, w, h, area)
         status = "ok" if confidence >= CONFIDENCE_FLOOR else "low_confidence"
+
+        # Only learn from shape-validated, confident gates so the histogram
+        # doesn't drift onto background.
+        if self.adaptive and status == "ok":
+            self._learn_color(hsv, x, y, w, h)
 
         return GateDetection(
             found=True,
@@ -251,14 +321,21 @@ def main():
     parser.add_argument("--port", type=int, default=5600)
     parser.add_argument("--timeout", type=float, default=2.0)
     parser.add_argument("--tune", action="store_true", help="show HSV trackbars")
+    parser.add_argument(
+        "--adaptive",
+        action="store_true",
+        help="learn gate color online (histogram backprojection) to follow drift",
+    )
     args = parser.parse_args()
 
     frames = _import_frames()
-    detector = GateDetector()
+    detector = GateDetector(adaptive=args.adaptive)
 
     window = "gate perception"
     cv2.namedWindow(window, cv2.WINDOW_NORMAL)
     tuner = _make_tuner(detector) if args.tune else None
+    if args.adaptive:
+        cv2.namedWindow("backprojection", cv2.WINDOW_NORMAL)
 
     print(f"Listening for camera frames on udp://{args.ip}:{args.port}")
     print("Press q or Esc to exit.")
@@ -283,6 +360,8 @@ def main():
             cv2.imshow(window, detector.draw_overlay(image, det))
             if tuner is not None:
                 tuner()
+            if args.adaptive and detector.last_backproj is not None:
+                cv2.imshow("backprojection", detector.last_backproj)
 
         key = cv2.waitKey(1) & 0xFF
         if key in (27, ord("q")):
