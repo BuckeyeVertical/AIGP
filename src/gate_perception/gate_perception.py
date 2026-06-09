@@ -37,10 +37,13 @@ FX, FY = 320.0, 320.0
 # (0-15) and let the saturation floor reject the grey background.
 #
 # Band format is ((H_lo,S_lo,V_lo), (H_hi,S_hi,V_hi)); H_lo > H_hi marks a
-# hue-wrap band (split around 0/180 in _band_mask). The S floor (~40) is the key
-# knob: grey sits near S=0 while even the washed-out pink holds S~59, so a modest
-# floor separates them. Retune with --tune.
-GATE_BAND = ((130, 40, 50), (15, 255, 255))
+# hue-wrap band (split around 0/180 in _band_mask). The S floor is the key knob:
+# grey sits at S~0, while the gate -- even blown out to a near-white pink like
+# #ffebfd (HSV ~(153,20,255)) -- holds a little saturation. The floor is set just
+# under that (18) to catch the palest pink while still rejecting grey. Going
+# lower risks grey leaking in (morphology + the shape filter absorb minor leaks).
+# Retune with --tune.
+GATE_BAND = ((130, 18, 50), (15, 255, 255))
 GATE_BANDS = [GATE_BAND]
 
 # A detection below this confidence is reported but flagged low_confidence.
