@@ -5,8 +5,8 @@ visible, where is its center, how big is it, how confident are we. The pipeline
 is HSV threshold -> morphology -> contours -> best candidate -> bounding box /
 center -> confidence -> pixel-to-angle.
 
-Default color band targets magenta gates; thresholds are starting values meant
-to be retuned against the real stream (run this file with --tune).
+Default color band targets the red-orange gate color (~#f52b03); thresholds are
+starting values meant to be retuned against the real stream (run with --tune).
 
 Out of scope for this first attempt (future work): partial-gate handling,
 temporal tracking/smoothing, multi-candidate scoring, inner-square center
@@ -29,10 +29,13 @@ import numpy as np
 CX, CY = 320.0, 180.0
 FX, FY = 320.0, 320.0
 
-# Magenta HSV band (OpenCV hue is 0-180; magenta ~150, no hue wrap so one band).
+# Gate HSV band. Target color ~#f52b03 (vivid red-orange), which sits at hue ~5
+# on OpenCV's 0-180 scale -- the red end where hue wraps past 0/180. When lower
+# H > upper H the mask treats it as a wrap band (see _mask): here that captures
+# orange-red (0-12) plus deep red (170-179) so lighting shifts stay covered.
 # Starting values -- retune with --tune against a live frame.
-LOWER_MAGENTA = (140, 80, 80)
-UPPER_MAGENTA = (170, 255, 255)
+LOWER_GATE_HSV = (170, 90, 70)
+UPPER_GATE_HSV = (12, 255, 255)
 
 # A detection below this confidence is reported but flagged low_confidence.
 CONFIDENCE_FLOOR = 0.35
@@ -59,8 +62,8 @@ def pixel_to_angle(px, py):
 class GateDetector:
     def __init__(
         self,
-        lower_hsv=LOWER_MAGENTA,
-        upper_hsv=UPPER_MAGENTA,
+        lower_hsv=LOWER_GATE_HSV,
+        upper_hsv=UPPER_GATE_HSV,
         min_area=400,
         kernel_size=5,
     ):
@@ -74,7 +77,15 @@ class GateDetector:
 
     def _mask(self, image_bgr):
         hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(hsv, self.lower_hsv, self.upper_hsv)
+        lo, hi = self.lower_hsv, self.upper_hsv
+        if lo[0] <= hi[0]:
+            mask = cv2.inRange(hsv, lo, hi)
+        else:
+            # Hue wraps past 0/180 (reds): OR a low-hue band with a high-hue band,
+            # sharing the same S/V floor and ceiling.
+            low_band = cv2.inRange(hsv, np.array([0, lo[1], lo[2]], np.uint8), hi)
+            high_band = cv2.inRange(hsv, lo, np.array([179, hi[1], hi[2]], np.uint8))
+            mask = cv2.bitwise_or(low_band, high_band)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self.kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self.kernel)
         return mask
