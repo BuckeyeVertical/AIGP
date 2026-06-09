@@ -29,13 +29,19 @@ import numpy as np
 CX, CY = 320.0, 180.0
 FX, FY = 320.0, 320.0
 
-# Gate HSV band. Target color ~#f52b03 (vivid red-orange), which sits at hue ~5
-# on OpenCV's 0-180 scale -- the red end where hue wraps past 0/180. When lower
-# H > upper H the mask treats it as a wrap band (see _mask): here that captures
-# orange-red (0-12) plus deep red (170-179) so lighting shifts stay covered.
-# Starting values -- retune with --tune against a live frame.
-LOWER_GATE_HSV = (170, 90, 70)
-UPPER_GATE_HSV = (12, 255, 255)
+# The gate shifts color under dynamic lighting, so the mask ORs several HSV
+# bands. Each band is ((H_lo,S_lo,V_lo), (H_hi,S_hi,V_hi)); a band whose H_lo >
+# H_hi is a hue-wrap band (split around 0/180 in _mask). Retune with --tune.
+#
+# RED_BAND: the normal gate color ~#f52b03 -> HSV ~(5,252,245). Hue wraps past
+# 0/180, so this captures orange-red (0-12) plus deep red (170-179).
+RED_BAND = ((170, 90, 70), (12, 255, 255))
+# GLARE_BAND: under bright light the gate blows out to a pale pink ~#ffc4f6 ->
+# HSV ~(155,59,255) -- opposite hue, low saturation, max brightness. A separate
+# low-saturation/high-value band catches this without dragging RED_BAND's floor
+# down (which would let washed-out background in).
+GLARE_BAND = ((145, 25, 190), (165, 130, 255))
+GATE_BANDS = [RED_BAND, GLARE_BAND]
 
 # A detection below this confidence is reported but flagged low_confidence.
 CONFIDENCE_FLOOR = 0.35
@@ -60,32 +66,34 @@ def pixel_to_angle(px, py):
 
 
 class GateDetector:
-    def __init__(
-        self,
-        lower_hsv=LOWER_GATE_HSV,
-        upper_hsv=UPPER_GATE_HSV,
-        min_area=400,
-        kernel_size=5,
-    ):
-        self.lower_hsv = np.array(lower_hsv, dtype=np.uint8)
-        self.upper_hsv = np.array(upper_hsv, dtype=np.uint8)
+    def __init__(self, bands=GATE_BANDS, min_area=400, kernel_size=5):
+        # Each band kept as (lower, upper) uint8 arrays; the mask ORs them all.
+        self.bands = [
+            (np.array(lo, dtype=np.uint8), np.array(hi, dtype=np.uint8))
+            for lo, hi in bands
+        ]
         self.min_area = min_area
         self.kernel = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE, (kernel_size, kernel_size)
         )
         self.last_mask = None  # cleaned mask from the most recent detect()
 
+    @staticmethod
+    def _band_mask(hsv, lo, hi):
+        if lo[0] <= hi[0]:
+            return cv2.inRange(hsv, lo, hi)
+        # Hue wraps past 0/180 (reds): OR a low-hue band with a high-hue band,
+        # sharing the same S/V floor and ceiling.
+        low_band = cv2.inRange(hsv, np.array([0, lo[1], lo[2]], np.uint8), hi)
+        high_band = cv2.inRange(hsv, lo, np.array([179, hi[1], hi[2]], np.uint8))
+        return cv2.bitwise_or(low_band, high_band)
+
     def _mask(self, image_bgr):
         hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
-        lo, hi = self.lower_hsv, self.upper_hsv
-        if lo[0] <= hi[0]:
-            mask = cv2.inRange(hsv, lo, hi)
-        else:
-            # Hue wraps past 0/180 (reds): OR a low-hue band with a high-hue band,
-            # sharing the same S/V floor and ceiling.
-            low_band = cv2.inRange(hsv, np.array([0, lo[1], lo[2]], np.uint8), hi)
-            high_band = cv2.inRange(hsv, lo, np.array([179, hi[1], hi[2]], np.uint8))
-            mask = cv2.bitwise_or(low_band, high_band)
+        mask = None
+        for lo, hi in self.bands:
+            band = self._band_mask(hsv, lo, hi)
+            mask = band if mask is None else cv2.bitwise_or(mask, band)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self.kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self.kernel)
         return mask
@@ -210,20 +218,29 @@ def _import_frames():
 
 
 def _make_tuner(detector):
-    win = "mask (tune)"
-    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+    """One trackbar window per band (6 sliders each) plus the combined mask."""
     names = ["H lo", "S lo", "V lo", "H hi", "S hi", "V hi"]
-    init = list(detector.lower_hsv) + list(detector.upper_hsv)
     maxes = [180, 255, 255, 180, 255, 255]
-    for name, val, mx in zip(names, init, maxes):
-        cv2.createTrackbar(name, win, int(val), mx, lambda _v: None)
+    band_wins = []
+    for i, (lo, hi) in enumerate(detector.bands):
+        win = f"band {i} (tune)"
+        cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+        for name, val, mx in zip(names, list(lo) + list(hi), maxes):
+            cv2.createTrackbar(name, win, int(val), mx, lambda _v: None)
+        band_wins.append(win)
+
+    mask_win = "mask (tune)"
+    cv2.namedWindow(mask_win, cv2.WINDOW_NORMAL)
 
     def apply():
-        vals = [cv2.getTrackbarPos(n, win) for n in names]
-        detector.lower_hsv = np.array(vals[:3], dtype=np.uint8)
-        detector.upper_hsv = np.array(vals[3:], dtype=np.uint8)
+        for i, win in enumerate(band_wins):
+            vals = [cv2.getTrackbarPos(n, win) for n in names]
+            detector.bands[i] = (
+                np.array(vals[:3], dtype=np.uint8),
+                np.array(vals[3:], dtype=np.uint8),
+            )
         if detector.last_mask is not None:
-            cv2.imshow(win, detector.last_mask)
+            cv2.imshow(mask_win, detector.last_mask)
 
     return apply
 
