@@ -206,3 +206,93 @@ A change is not competition-useful unless it preserves or improves the following
 - The drone can recover or fail safely when a gate is not detected.
 - Relevant telemetry and perception outputs are inspectable through logs or debug tools.
 
+## Simulator Reality vs Spec (empirically established, 2026-06-09)
+
+Everything in this section was reverse-engineered by flying probe scripts
+against the actual DCL simulator, because the sim does NOT implement the
+MAVLink control messages the way the spec implies. The probe scripts live in
+`src/mavlink_client/*_probe.py` (plus `command_test.py`, `position_test.py`,
+`thrust_test.py`) and the model fitting in `fit_tilt_model.py`. Do not "fix"
+the sign conventions in `src/control/control.py` back to textbook NED without
+re-running those probes — every non-obvious sign in there is load-bearing.
+
+### Control interface
+
+- `SET_POSITION_TARGET_LOCAL_NED` (any typemask, velocity or position, BODY or
+  LOCAL frame) tilts the body but produces ZERO thrust. The drone never leaves
+  the ground. It cannot be used to fly.
+- `MAV_CMD_NAV_TAKEOFF` is ACK'd but does nothing.
+- `SET_ATTITUDE_TARGET` is the only interface that flies, but the sim decodes
+  the quaternion to euler angles and treats them as BODY-RATE commands, not an
+  attitude target:
+  - `d(roll_reported)/dt  ~= -2.5 * q_roll`
+  - `d(pitch_reported)/dt ~= -2.4 * q_pitch`
+  - `yawspeed             ~= +2.28 * q_yaw`
+  - the thrust field works normally (0..1)
+- Sending a constant "level attitude" quaternion therefore spins/tilts the
+  drone instead of leveling it. Setting all rate-ignore typemask bits plus
+  ATTITUDE_IGNORE removes all stabilization and the drone flips.
+- Client code must close every loop itself: velocity -> desired tilt ->
+  tilt-rate -> quaternion encoding (see the cascade in `src/control/control.py`).
+
+### Telemetry frames (mixed conventions — trust nothing by default)
+
+- `ATTITUDE.yaw` is TRUE NED yaw (verified against course over ground).
+- `ATTITUDE.pitch` is sign-INVERTED vs NED (FLU-style export): positive
+  reported pitch corresponds to body-forward acceleration.
+- Tilt-to-acceleration mapping (fit across flight logs, corr 0.86):
+  `a_world = g * Rz(-yaw) @ (pitch_rep, roll_rep)` — the (fwd, right) tilt
+  vector lives in a LEFT-HANDED yaw frame. To realize a desired true-body
+  acceleration, pre-rotate the tilt target by +2*yaw before sending.
+- `LOCAL_POSITION_NED` is trustworthy true NED for both position and velocity.
+- `ODOMETRY` velocity is FLU body frame (`vy` sign-flipped vs body-right).
+  Never merge `LOCAL_POSITION_NED` and `ODOMETRY` velocities interchangeably —
+  doing so makes the feedback sign alternate sample-to-sample.
+
+### Flight characteristics
+
+- Hover thrust ~= 0.25-0.27 (the adaptive hover integrator in control.py
+  converges there). Liftoff from ground needs ~0.28 to break contact.
+- Thrust 0 while airborne does NOT mean motors off (the drone keeps climbing
+  for a while); thrust 0.9 reaches ~30 m/s climb. Keep a hard cap (~0.45).
+- The drone can sink/fall through the floor when tumbling; out-of-bounds
+  causes a respawn at the start gate plus DISARM (all subsequent commands are
+  silently ignored — re-arm or restart).
+- Arming sometimes respawns the drone at the start (reliably after
+  out-of-bounds, not reliably otherwise). Reset the sim manually between runs.
+- At spawn the drone faces yaw ~= pi and rests with reported pitch +0.31; the
+  first gate plane is ~23.5 m ahead (x ~= -23.5, straight down y ~= 0).
+
+### Perception behavior near gates
+
+- The HSV gate detector's bounding box never reaches the geometric gate size;
+  it peaks around 150 px during approach (partial ring coverage).
+- Within ~10 m of a gate the detected center SLIDES sideways in the image (a
+  bbox artifact as the ring fills the view) even when the drone flies
+  perfectly straight. Chasing that slide steers the drone into the gate posts.
+- At point-blank range (gate mouth) detection collapses entirely ("no gate").
+- Working pass strategy (`control.py`): commit while still centered (bbox
+  max(w,h) >= 100 px and |ex| <= 0.15 rad) and cross the final meters as
+  chained straight dashes; if the gate is lost right after a centered lock,
+  blind-dash through. First clean gate pass achieved with this strategy.
+
+### Client requirements that are easy to miss
+
+- The client must stream its own HEARTBEAT at >= 2 Hz
+  (`MAVLinkClient.start_heartbeat()`); the starter code never sent one.
+- Command rate must stay < 100 Hz; the control loop is paced by the 30 Hz
+  camera stream (the frames generator yields `None` every 0.25 s when idle so
+  the command stream never stalls).
+
+### Current state and known gaps
+
+- `src/control/control.py` flies: takeoff -> visual servo -> chained dash ->
+  through gate 1 -> brake to hover -> yaw search. Run it with
+  `python src\control\control.py --max-seconds 60 --log flight.csv`.
+- Open problem: after passing gate 1 the yaw search does not find gate 2
+  (detector range/thresholds or camera geometry). Next work: longer-range
+  detection (lower `min_area`, looser aspect filter), search that also climbs,
+  and forward exploration along the last flight direction.
+- Tuning is deliberately slow (V_FAST 0.8, dash 1.2 m/s). Speed up only after
+  multi-gate passes are reliable.
+
