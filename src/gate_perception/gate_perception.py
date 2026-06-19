@@ -49,6 +49,12 @@ GATE_BANDS = [GATE_BAND]
 # A detection below this confidence is reported but flagged low_confidence.
 CONFIDENCE_FLOOR = 0.35
 
+# When the gate bbox comes within this many pixels of a frame border, that side
+# of the ring is leaving the image: the bbox is being clipped by the frame edge,
+# so its center on that axis slides toward the still-visible side and can no
+# longer be trusted. Control latches the last fully-in-frame center instead.
+CLIP_MARGIN_PX = 6
+
 # Inner opening as a fraction of the outer gate (1500mm inner / 2700mm outer).
 # Used to sample only the colored frame ring when learning gate color.
 INNER_RATIO = 1500.0 / 2700.0
@@ -65,6 +71,11 @@ class GateDetection:
     angle_y: float = 0.0  # radians, + is below image center
     confidence: float = 0.0
     status: str = "no_gate"  # ok | no_gate | low_confidence
+    # The bbox touches a frame border on this axis -> its center on that axis is
+    # being clipped and is unreliable (see CLIP_MARGIN_PX).
+    clipped_x: bool = False
+    clipped_y: bool = False
+    partial: bool = False  # clipped_x or clipped_y: gate leaving the frame
 
 
 def pixel_to_angle(px, py):
@@ -202,6 +213,13 @@ class GateDetector:
         confidence = self._confidence(mask, x, y, w, h, area)
         status = "ok" if confidence >= CONFIDENCE_FLOOR else "low_confidence"
 
+        # Frame-edge clip detection: if the bbox hugs a border the ring is
+        # leaving the frame on that axis, so center on that axis is unreliable.
+        img_h, img_w = mask.shape[:2]
+        m = CLIP_MARGIN_PX
+        clipped_x = x <= m or (x + w) >= (img_w - m)
+        clipped_y = y <= m or (y + h) >= (img_h - m)
+
         # Only learn from shape-validated, confident gates so the histogram
         # doesn't drift onto background.
         if self.adaptive and status == "ok":
@@ -217,6 +235,9 @@ class GateDetector:
             angle_y=angle_y,
             confidence=confidence,
             status=status,
+            clipped_x=clipped_x,
+            clipped_y=clipped_y,
+            partial=clipped_x or clipped_y,
         )
 
     def _confidence(self, mask, x, y, w, h, area):

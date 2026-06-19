@@ -2,6 +2,29 @@
 
 This repository is a starter client for the AI Grand Prix Virtual Qualifier. Coding agents should treat the task as building an autonomous drone racer, not a generic simulator demo.
 
+## Keeping This File Current
+
+This file is the shared source of truth for agents working in this repo. Keep
+it in sync with reality:
+
+- Whenever you learn something non-obvious about the simulator, the control
+  stack, or the codebase (a new sign convention, a quirk, a fixed bug, a
+  working strategy), record it here in the relevant section.
+- Whenever something changes — files move or are renamed, the run command
+  changes, interfaces or constants change, a "known gap" is closed — update
+  every place in this file that referenced the old behavior (file map, run
+  commands, caveats, current state).
+- Update CLAUDE.md as part of the same change that caused it, not as a
+  follow-up. A change that alters documented behavior is not done until this
+  file reflects it.
+- Prefer correcting/replacing stale lines over appending duplicates.
+- Keep it DURABLE: document how the sim behaves and how the code is meant to
+  work (conventions, frames/directions, gotchas, design intent). Do NOT paste
+  specific run logs, telemetry dumps, one-off measured positions, dated "ran it
+  and it worked" notes, or other transient state — that is noise for the next
+  agent. Provenance like "established by probing" is fine; a play-by-play of a
+  run is not.
+
 ## Competition Objective
 
 Virtual Qualifier 1 is an autonomous gate-navigation time trial. The drone must complete a course made of a start gate, intermediate gates, and a finish gate. The practical goal is to pass every required gate quickly and reliably using onboard telemetry and the first-person camera stream.
@@ -270,11 +293,31 @@ re-running those probes — every non-obvious sign in there is load-bearing.
 - Within ~10 m of a gate the detected center SLIDES sideways in the image (a
   bbox artifact as the ring fills the view) even when the drone flies
   perfectly straight. Chasing that slide steers the drone into the gate posts.
+  Root cause: once a ring edge leaves the frame the bbox is clipped by the
+  image border, so the bbox center jumps toward the still-visible side.
+- The detector flags this: `GateDetection.clipped_x/clipped_y/partial` are set
+  when the bbox comes within `CLIP_MARGIN_PX` (6 px) of a frame border
+  (`gate_perception.py`). IMPORTANT: only `clipped_x` (horizontal) matters for
+  the slide/veer. `clipped_y` fires harmlessly early because the gate is framed
+  LOW (cy ~= 300 due to the 20 deg camera up-tilt), so its bbox bottom hits the
+  frame edge while still several metres out and perfectly centered. An earlier
+  attempt gated steering on `partial` (= clipped_x OR clipped_y); the spurious
+  clipped_y blocked the commit and the drone veered. Do NOT gate centering or
+  commit on clipped_y / partial.
 - At point-blank range (gate mouth) detection collapses entirely ("no gate").
-- Working pass strategy (`control.py`): commit while still centered (bbox
-  max(w,h) >= 100 px and |ex| <= 0.15 rad) and cross the final meters as
-  chained straight dashes; if the gate is lost right after a centered lock,
-  blind-dash through. First clean gate pass achieved with this strategy.
+- Pass strategy (`src/run/center.py`):
+  - `last_good` latches the last horizontally-clean (`not clipped_x`), centered
+    detection including its bbox center.
+  - Commit to the dash while still centered (`not clipped_x`, max(w,h) >= 100 px
+    and |ex| <= 0.15 rad), OR as soon as `clipped_x` goes true (horizontal edge
+    leaving) after a recent centered lock -> finish straight, never chase the
+    slide. These chain into multiple commits across the final metres.
+  - While `clipped_x` but not yet committing, servo on the LATCHED center, not
+    the sliding one.
+  - If the gate is lost right after a centered lock, blind-dash through.
+  - `VisualServoController(search_yaw_rate=0.0)` makes a lost gate HOLD heading
+    instead of yaw-searching, so there is no post-pass veer. Re-enable a search
+    when multi-gate acquisition is wanted.
 
 ### Client requirements that are easy to miss
 
@@ -284,15 +327,19 @@ re-running those probes — every non-obvious sign in there is load-bearing.
   camera stream (the frames generator yields `None` every 0.25 s when idle so
   the command stream never stalls).
 
-### Current state and known gaps
+### Code layout and known gaps
 
-- `src/control/control.py` flies: takeoff -> visual servo -> chained dash ->
-  through gate 1 -> brake to hover -> yaw search. Run it with
-  `python src\control\control.py --max-seconds 60 --log flight.csv`.
-- Open problem: after passing gate 1 the yaw search does not find gate 2
-  (detector range/thresholds or camera geometry). Next work: longer-range
-  detection (lower `min_area`, looser aspect filter), search that also climbs,
-  and forward exploration along the last flight direction.
+- `src/control/control.py` holds the flight logic (cascade controller,
+  perception/control classes, tuning constants). The entry point is
+  `src/run/center.py`, which wires up camera/perception/MAVLink and runs the
+  loop: takeoff -> visual servo -> chained dash -> straight through gate ->
+  hold heading. Run it with
+  `python src\run\center.py --max-seconds 60 --log flight.csv`.
+- Single-gate only: the yaw search is disabled (`search_yaw_rate=0`), so after
+  a pass the drone holds heading rather than reacquiring. Gate 2+ acquisition is
+  unimplemented — it needs a deliberate search (re-enable a yaw scan, possibly
+  climbing / exploring forward along the last flight direction) and
+  longer-range detection (lower `min_area`, looser aspect filter).
 - Tuning is deliberately slow (V_FAST 0.8, dash 1.2 m/s). Speed up only after
   multi-gate passes are reliable.
 
