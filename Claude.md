@@ -335,6 +335,16 @@ re-running those probes — every non-obvious sign in there is load-bearing.
   loop: takeoff -> visual servo -> chained dash -> straight through gate ->
   hold heading. Run it with
   `python src\run\center.py --max-seconds 60 --log flight.csv`.
+- `src/run/manual.py` is a manual flight/debug entry point using the same
+  calibrated control cascade. It auto-takes off, then maps arrow keys to
+  forward/back/strafe, W/S to climb/descend, and A/D to yaw. Its defaults are
+  2.5 m/s horizontal, 1.2 m/s vertical, and 1.0 rad/s yaw. Every run writes a
+  timestamped bundle under `logs/manual/` with every decoded camera frame, a
+  camera index, every raw MAVLink message, per-control-tick state/commands, and
+  event/metadata files. Run it with `python src\run\manual.py`. This is for
+  debugging only; manual input is not allowed during a submitted timed flight.
+  Manual commands have no altitude/ground safety override: held S remains a
+  positive NED-Z (downward) velocity request at every reported altitude.
 - Single-gate only: the yaw search is disabled (`search_yaw_rate=0`), so after
   a pass the drone holds heading rather than reacquiring. Gate 2+ acquisition is
   unimplemented — it needs a deliberate search (re-enable a yaw scan, possibly

@@ -176,17 +176,17 @@ class GateDetector:
             # Exponential moving average so color tracks drift but resists jumps.
             self._hist = (1 - self.learn_rate) * self._hist + self.learn_rate * hist
 
-    def detect(self, image_bgr) -> GateDetection:
-        hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
-        mask = self._build_mask(hsv)
-        self.last_mask = mask
+    def _candidate_boxes(self, mask):
+        """Shape-validated gate bounding boxes, largest area first.
 
+        Returns a list of (x, y, w, h, area). The aspect/min-area filters reject
+        non-gate blobs; the caller decides how many to keep (detect() takes the
+        largest, detect_all() keeps several so a second gate can be reasoned
+        about)."""
         contours, _ = cv2.findContours(
             mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
-
-        best = None
-        best_area = 0.0
+        boxes = []
         for c in contours:
             area = cv2.contourArea(c)
             if area < self.min_area:
@@ -197,16 +197,11 @@ class GateDetector:
             aspect = w / h
             if aspect < 0.5 or aspect > 2.0:  # keep roughly square gate outlines
                 continue
-            # First attempt: pick the largest passing contour. The final detector
-            # replaces blind-largest with a scored candidate selection.
-            if area > best_area:
-                best_area = area
-                best = (c, x, y, w, h, area)
+            boxes.append((x, y, w, h, area))
+        boxes.sort(key=lambda b: b[4], reverse=True)
+        return boxes
 
-        if best is None:
-            return GateDetection(found=False, status="no_gate")
-
-        c, x, y, w, h, area = best
+    def _build_detection(self, mask, x, y, w, h, area) -> GateDetection:
         center_x = x + w / 2.0
         center_y = y + h / 2.0
         angle_x, angle_y = pixel_to_angle(center_x, center_y)
@@ -219,11 +214,6 @@ class GateDetector:
         m = CLIP_MARGIN_PX
         clipped_x = x <= m or (x + w) >= (img_w - m)
         clipped_y = y <= m or (y + h) >= (img_h - m)
-
-        # Only learn from shape-validated, confident gates so the histogram
-        # doesn't drift onto background.
-        if self.adaptive and status == "ok":
-            self._learn_color(hsv, x, y, w, h)
 
         return GateDetection(
             found=True,
@@ -239,6 +229,44 @@ class GateDetector:
             clipped_y=clipped_y,
             partial=clipped_x or clipped_y,
         )
+
+    def detect(self, image_bgr) -> GateDetection:
+        hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+        mask = self._build_mask(hsv)
+        self.last_mask = mask
+
+        boxes = self._candidate_boxes(mask)
+        if not boxes:
+            return GateDetection(found=False, status="no_gate")
+
+        x, y, w, h, area = boxes[0]  # largest passing contour
+        det = self._build_detection(mask, x, y, w, h, area)
+
+        # Only learn from shape-validated, confident gates so the histogram
+        # doesn't drift onto background.
+        if self.adaptive and det.status == "ok":
+            self._learn_color(hsv, x, y, w, h)
+        return det
+
+    def detect_all(self, image_bgr, max_candidates=3):
+        """Like detect(), but return up to ``max_candidates`` gates, largest
+        bbox first. Useful for multi-gate logic: the largest is the gate being
+        approached, the second-largest is the next gate (it is nearer, and so
+        bigger, than any gates beyond it). Returns ``[GateDetection(found=False)]``
+        when nothing passes, so callers can always read index 0."""
+        hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+        mask = self._build_mask(hsv)
+        self.last_mask = mask
+
+        boxes = self._candidate_boxes(mask)
+        if not boxes:
+            return [GateDetection(found=False, status="no_gate")]
+
+        dets = [self._build_detection(mask, *b) for b in boxes[:max_candidates]]
+        if self.adaptive and dets[0].status == "ok":
+            x, y, w, h, _ = boxes[0]
+            self._learn_color(hsv, x, y, w, h)
+        return dets
 
     def _confidence(self, mask, x, y, w, h, area):
         """Blend of apparent size, squareness, and how much of the bbox is gate
