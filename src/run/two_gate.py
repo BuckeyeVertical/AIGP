@@ -305,7 +305,7 @@ def main():
                 # that means we are still too HIGH -> keep descending to lift it.
                 bottom = det.center_y + det.height_px / 2.0
                 bottom_clipped = bottom >= G2_BOTTOM_CLIP_Y
-                if size >= G2_PASS_PX:
+                if size >= G2_CLOSE_PX:
                     g2_close = True
                 centered = (
                     abs(ex_px) <= G2_ALIGN_PX
@@ -315,7 +315,7 @@ def main():
                 # Commit when close + horizontally lined up: at the mouth the gate
                 # fills the frame so the vertical row is unreliable; chasing it is
                 # what made the drone bounce in place instead of going through.
-                if size >= G2_PASS_PX and abs(ex_px) <= G2_ALIGN_PX:
+                if size >= G2_MOUTH_PX and abs(ex_px) <= G2_ALIGN_PX:
                     print(
                         f"gate 2 close & lined up (w={det.width_px} h={det.height_px}px), "
                         f"dashing THROUGH"

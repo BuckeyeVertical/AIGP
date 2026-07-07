@@ -184,7 +184,7 @@ These are important when modifying the repo:
 - `vision_rx.py` decodes frames but leaves `process_frame()` empty. Gate detection belongs here or in a perception module called from here.
 - `main.py` has an infinite loop and no race-finished stop condition.
 - `main.py` calls `ts_loop.get_thread_for_join().join(...)` after the loop, but if `TimeSync` was not started then `get_thread_for_join()` returns `None`.
-- Direct use of global position or track-map knowledge may be contrary to the intended VQ1 approach. Prefer camera-driven gate detection and telemetry-driven stabilization unless the official competition package explicitly allows a data source.
+- Track-map knowledge is a sanctioned data source: the simulator itself broadcasts every gate's NED pose over `ENCAPSULATED_DATA`, and the official starter code (`examples/mavlink_rx.py`) parses it. See "Race status and track data" below.
 
 ## Recommended Agent Work Plan
 
@@ -319,21 +319,71 @@ re-running those probes — every non-obvious sign in there is load-bearing.
     instead of yaw-searching, so there is no post-pass veer. Re-enable a search
     when multi-gate acquisition is wanted.
 
+### Race status and track data (official, decoded from the sim's broadcasts)
+
+The sim streams two feeds over `ENCAPSULATED_DATA` that the official starter
+parses (`examples/mavlink_rx.py`); `src/mavlink_client/race_data.py` is our
+decoder (run it on a logged `mavlink.jsonl` to verify offline):
+
+- Race status (payload byte 0 == 1, ~4 Hz, streams continuously):
+  `<BQqqIq` -> data_type, sim_boot_time_ms, race_start_boot_time_ms,
+  race_finish_time_ns, active_gate_index, last_gate_race_time (ns). Values
+  are -1 for "not yet". `active_gate_index` is the authoritative
+  which-gate-is-next signal (the sim decides what counts as a pass);
+  `race_finish_time_ns > 0` is the authoritative finish. The race clock is
+  already running at spawn (starts at sim reset, not at the first gate).
+- Track data (payload byte 0 == 2): the full course map. Chunked transfer
+  announced by `DATA_TRANSMISSION_HANDSHAKE` (`width` = transfer id,
+  `packets` = chunk count); reassembled payload is `<H` gate count then per
+  gate `<Hfffffffff` = id, NED xyz, quaternion wxyz, width, height.
+  CAVEATS: it is broadcast only at race (re)start — a client attaching
+  mid-session never sees it (keep a fallback table; the environment is
+  deterministic), and broadcasts sent around a reset can be in the PREVIOUS
+  session's NED origin (sanity-check gate 0 against the known spawn-relative
+  position before adopting).
+- Gate `position_ned_z` is the gate's BOTTOM edge: the successful manual run
+  crossed every gate at z ~= gate_z - 1.2..1.5, i.e. aim for
+  `gate_z - height/2` (`Gate.center_z`).
+- VQ1 course (spawn-relative NED, from the broadcast): 6 gates, all
+  2.72 x 2.72 m, same orientation, running straight down -X while DESCENDING
+  26 m: (-23.3,-0.4,-0.0) (-46.9,-2.5,+5.1) (-74.6,+1.2,+13.7)
+  (-111.5,-5.1,+24.6) (-135.5,-0.8,+25.4) (-159.2,-4.4,+26.0). The manual
+  run flew the whole course at yaw ~= pi (never yawed) at ~2.3 m/s,
+  finishing in 109.6 s.
+
 ### Client requirements that are easy to miss
 
 - The client must stream its own HEARTBEAT at >= 2 Hz
   (`MAVLinkClient.start_heartbeat()`); the starter code never sent one.
-- Command rate must stay < 100 Hz; the control loop is paced by the 30 Hz
-  camera stream (the frames generator yields `None` every 0.25 s when idle so
-  the command stream never stalls).
+- Command rate must stay < 100 Hz; vision-driven loops are paced by the
+  30 Hz camera stream (the frames generator yields `None` every 0.25 s when
+  idle so the command stream never stalls); `src/run/race.py` paces itself
+  at 30 Hz with sleeps (no camera needed).
+- Chunked track data needs every pending MAVLink message:
+  `MAVLinkClient.recv_all()` drains in arrival order; the latest-per-type
+  `recv_telemetry()` drops chunks.
+- The sim world can be reset remotely with COMMAND_LONG id 31000
+  (`MAVLinkClient.send_sim_reset()`); it respawns the drone at the start and
+  the race clock restarts.
 
 ### Code layout and known gaps
 
+- `src/run/race.py` is the PRIMARY autonomous entry point: full-course
+  waypoint corridor flight on `LOCAL_POSITION_NED`, holding yaw ~= pi and
+  P-correcting cross-track y/z toward each gate's opening center
+  (`Gate.center_z`), sequenced by `active_gate_index` and stopped by the
+  finish signal. Live track data is adopted only when its gate 0 matches the
+  fallback table (stale-frame guard); a missed plane crossing without race
+  credit triggers a go-around; a position teleport (respawn) re-arms and
+  restarts. No camera needed. Run it with
+  `python src\run\race.py --reset --max-seconds 300` (design doc:
+  `docs/superpowers/specs/2026-07-06-autonomous-race-runner-design.md`).
 - `src/control/control.py` holds the flight logic (cascade controller,
-  perception/control classes, tuning constants). The entry point is
-  `src/run/center.py`, which wires up camera/perception/MAVLink and runs the
-  loop: takeoff -> visual servo -> chained dash -> straight through gate ->
-  hold heading. Run it with
+  perception/control classes, tuning constants). `src/run/center.py` is the
+  vision-only single-gate entry point (takeoff -> visual servo -> chained
+  dash -> straight through gate -> hold heading); `src/run/two_gate.py`
+  extends it to chase gate 2 by vision. Both are superseded by `race.py` for
+  course completion but remain the visual-servo testbeds. Run with
   `python src\run\center.py --max-seconds 60 --log flight.csv`.
 - `src/run/manual.py` is a manual flight/debug entry point using the same
   calibrated control cascade. It auto-takes off, then maps arrow keys to
@@ -345,11 +395,10 @@ re-running those probes — every non-obvious sign in there is load-bearing.
   debugging only; manual input is not allowed during a submitted timed flight.
   Manual commands have no altitude/ground safety override: held S remains a
   positive NED-Z (downward) velocity request at every reported altitude.
-- Single-gate only: the yaw search is disabled (`search_yaw_rate=0`), so after
-  a pass the drone holds heading rather than reacquiring. Gate 2+ acquisition is
-  unimplemented — it needs a deliberate search (re-enable a yaw scan, possibly
-  climbing / exploring forward along the last flight direction) and
-  longer-range detection (lower `min_area`, looser aspect filter).
-- Tuning is deliberately slow (V_FAST 0.8, dash 1.2 m/s). Speed up only after
-  multi-gate passes are reliable.
+- The vision-only pipeline remains single-gate in practice (gate 2 sits far
+  BELOW gate 1 and outside the up-tilted camera's view during the approach);
+  multi-gate completion is `race.py`'s job. Vision's future role is optional
+  fine-trim near gates, not primary navigation.
+- `race.py` cruises at 2.5 m/s (the manual run's proven speed). Raise speed
+  only after full-course finishes are reliable.
 

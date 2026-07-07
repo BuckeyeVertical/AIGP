@@ -16,6 +16,10 @@ from pymavlink import mavutil
 DEFAULT_IP = "127.0.0.1"
 DEFAULT_PORT = 14550
 
+# Custom COMMAND_LONG the sim accepts to reset the world (from the starter
+# code's examples/controller.py).
+MAVLINK_CMD_SIM_RESET = 31000
+
 # Body-frame velocity + yaw-rate setpoint: ignore position, acceleration, and the
 # yaw *angle*, leaving vx/vy/vz and yaw_rate active.
 _BODY_VELOCITY_MASK = (
@@ -72,6 +76,26 @@ class MAVLinkClient:
             0,
             1,  # arm
             0, 0, 0, 0, 0, 0,
+        )
+
+    def disarm(self):
+        self.sim_conn.mav.command_long_send(
+            self.sim_conn.target_system,
+            self.sim_conn.target_component,
+            mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+            0,
+            0,  # disarm
+            0, 0, 0, 0, 0, 0,
+        )
+
+    def send_sim_reset(self):
+        """Reset the simulator world (respawns the drone at the start gate)."""
+        self.sim_conn.mav.command_long_send(
+            self.sim_conn.target_system,
+            self.sim_conn.target_component,
+            MAVLINK_CMD_SIM_RESET,
+            0,  # confirmation
+            0, 0, 0, 0, 0, 0, 0,
         )
 
     def send_body_velocity(self, vx, vy, vz, yaw_rate, frame=None):
@@ -135,3 +159,19 @@ class MAVLinkClient:
             if msg is None:
                 return latest
             latest[msg.get_type()] = msg
+
+    def recv_all(self):
+        """Drain and return every pending MAVLink message, in arrival order.
+
+        Use this instead of recv_telemetry() when a consumer needs every
+        message rather than the latest per type -- the chunked track-data
+        transfer (multiple ENCAPSULATED_DATA per burst) is lost by
+        latest-per-type draining.
+        """
+        messages = []
+        while True:
+            msg = self.sim_conn.recv_match(blocking=False)
+            if msg is None:
+                return messages
+            if msg.get_type() != "BAD_DATA":
+                messages.append(msg)
